@@ -308,168 +308,239 @@ Proces zrestartowany pomyślnie
 - Częstotliwość błędów
 - Rozmiar plików logów
 
-## Rozwiązywanie problemów
+## Mechanizm zabijania procesów
 
-### Problem: Process nie startuje
-```bash
-# Sprawdź czy komenda jest poprawna
-sh -c "python3 app.py"
+### 🛡️ Graceful Shutdown - grzeczne zamykanie
 
-# Sprawdź uprawnienia
-ls -la /path/to/app.py
+Monitor implementuje inteligentny mechanizm zamykania procesów oparty na dwuetapowej strategii:
 
-# Sprawdź zależności
-which python3
+#### 1. Faza grzecznego zamknięcia (SIGTERM)
+```
+SIGTERM → oczekiwanie 5 sekund → sprawdzenie stanu
 ```
 
-### Problem: Częste restarty
-```yaml
-# Zwiększ timeout
-timeout: 300  # z 60 na 300 sekund
+- **Sygnał SIGTERM** - standardowy sygnał zamknięcia systemu Unix/Linux
+- **Timeout 5 sekund** - czas na grzeczne zakończenie operacji
+- **Proces może**:
+  - Zapisać dane do plików
+  - Zamknąć połączenia sieciowe  
+  - Wyczyścić zasoby
+  - Zakończyć się normalnie
 
-# Zmniejsz interwał (szybsze wykrywanie aktywności)
-interval: 2   # z 5 na 2 sekundy
+#### 2. Faza wymuszonego zamknięcia (SIGKILL)
+```
+SIGKILL → oczekiwanie 2 sekundy → cleanup
 ```
 
-### Problem: Logi nie są wykrywane
-```bash
-# Sprawdź czy aplikacja faktycznie pisze do pliku
-tail -f /tmp/app.log
+- **Sygnał SIGKILL** - natychmiastowe zabicie procesu (nie może być zignorowany)
+- **Timeout 2 sekundy** - czas na cleanup systemu
+- **Proces zostaje**:
+  - Natychmiast zakończony przez kernel
+  - Zwolnione zasoby systemowe
+  - Usunięty z listy procesów
 
-# Sprawdź uprawnienia do pliku
-ls -la /tmp/app.log
+### 🔍 Szczegółowy przepływ algorytmu
 
-# Sprawdź czy plik jest zapisywany
-watch "ls -la /tmp/app.log"
+```go
+func killProcessUnsafe() {
+    // 1. Sprawdź czy proces istnieje
+    if process == nil || process.Process == nil {
+        return "BRAK_PROCESU"
+    }
+
+    pid := process.Process.Pid
+    log("Zatrzymywanie procesu PID: %d", pid)
+
+    // 2. Wyślij SIGTERM (15)
+    err := process.Signal(syscall.SIGTERM)
+    if err != nil {
+        return "BŁĄD_SIGTERM"
+    }
+
+    // 3. Uruchom goroutine monitorującą
+    done := make(chan error, 1)
+    go func() {
+        done <- process.Wait() // Czeka na zakończenie
+    }()
+
+    // 4. Wyścig czasowy - 5 sekund na grzeczne zamknięcie
+    select {
+    case err := <-done:
+        // ✅ SUKCES - proces się zamknął
+        if err != nil {
+            log("Proces zakończony z błędem: %v", err)
+        } else {
+            log("Proces zakończony poprawnie")
+        }
+        return "ZAMKNIĘTY_GRZECZNIE"
+
+    case <-time.After(5 * time.Second):
+        // ⏰ TIMEOUT - wymuszenie zamknięcia
+        log("Wymuszanie zakończenia procesu (SIGKILL)...")
+        
+        // 5. Wyślij SIGKILL (9)
+        if process.Process != nil {
+            process.Process.Kill()
+            
+            // 6. Drugi wyścig czasowy - 2 sekundy na cleanup
+            select {
+            case <-done:
+                log("Proces zakończony wymuszenie")
+                return "ZAMKNIĘTY_WYMUSZENIE"
+            case <-time.After(2 * time.Second):
+                log("Proces może nie zostać prawidłowo zamknięty")
+                return "MOŻE_ZOMBIE"
+            }
+        }
+    }
+}
 ```
 
-### Problem: Monitor się zawiesza
-```bash
-# Sprawdź procesy
-ps aux | grep monitor
+### ⚡ Przykłady scenariuszy zamykania
 
-# Sprawdź sygnały
-kill -USR1 <monitor_pid>  # debug info
-kill -TERM <monitor_pid>  # graceful shutdown
+#### Scenariusz 1: Aplikacja współpracująca
+```
+14:30:15 Zatrzymywanie procesu PID: 12345
+14:30:15 → SIGTERM wysłany
+14:30:17 ← Proces zakończył się normalnie (2s)
+14:30:17 ✅ Proces zakończony poprawnie
 ```
 
-## Zaawansowane przypadki użycia
+#### Scenariusz 2: Aplikacja wolno zamykająca
+```
+14:30:15 Zatrzymywanie procesu PID: 12345  
+14:30:15 → SIGTERM wysłany
+14:30:20 ⏰ Timeout po 5 sekundach
+14:30:20 → SIGKILL wysłany
+14:30:20 ← Proces zabity natychmiast
+14:30:20 ✅ Proces zakończony wymuszenie
+```
 
-### 1. Monitoring klastra aplikacji
-```yaml
-processes:
-  - name: "web-1"
-    command: "python3 app.py --port 8001"
-    log_file: "/var/log/web-1.log"
-    timeout: 30
-    interval: 5
+#### Scenariusz 3: Proces zawieszony
+```
+14:30:15 Zatrzymywanie procesu PID: 12345
+14:30:15 → SIGTERM wysłany
+14:30:20 ⏰ Timeout po 5 sekundach
+14:30:20 → SIGKILL wysłany  
+14:30:22 ⏰ Timeout po 2 sekundach
+14:30:22 ⚠️ Proces może nie zostać prawidłowo zamknięty
+```
+
+### 🔒 Thread Safety i synchronizacja
+
+#### Mutex Protection
+```go
+type Monitor struct {
+    // ...existing fields...
+    mutex sync.RWMutex // Ochrona dostępu do procesu
+}
+
+// Bezpieczne publiczne API
+func (m *Monitor) killProcess() {
+    m.mutex.Lock()         // Ekskluzywny dostęp
+    defer m.mutex.Unlock()
+    m.killProcessUnsafe()  // Rzeczywista operacja
+}
+
+// Sprawdzanie stanu (współdzielony dostęp)
+func (m *Monitor) isProcessRunning() bool {
+    m.mutex.RLock()        // Współdzielony dostęp do odczytu
+    defer m.mutex.RUnlock()
     
-  - name: "web-2" 
-    command: "python3 app.py --port 8002"
-    log_file: "/var/log/web-2.log"
-    timeout: 30
-    interval: 5
-    
-  - name: "worker"
-    command: "python3 worker.py"
-    log_file: "/var/log/worker.log"
-    timeout: 120
-    interval: 10
+    return m.process != nil && processExists()
+}
 ```
 
-### 2. Monitoring z preprocessing
-```yaml
-processes:
-  - name: "data-processor"
-    command: "python3 processor.py | tee /tmp/processor.log"
-    log_file: "/tmp/processor.log"
-    timeout: 600  # 10 minut na batch
-    interval: 30
+#### Goroutine Management
+Monitor używa goroutines do nieblokującego oczekiwania:
+
+```go
+// Monitoring procesu w tle
+go func() {
+    done <- process.Wait()  // Czeka na zakończenie procesu
+}()
+
+// Główny wątek może robić inne rzeczy
+select {
+case result := <-done:     // Proces się zakończył
+    handleResult(result)
+case <-timeout:            // Upłynął timeout
+    forceKill()
+}
 ```
 
-### 3. Monitoring z cleanup
-```yaml
-processes:
-  - name: "cleaner"
-    command: "bash -c 'while true; do cleanup.sh >> /tmp/clean.log 2>&1; sleep 3600; done'"
-    log_file: "/tmp/clean.log" 
-    timeout: 7200  # 2 godziny
-    interval: 60
+### 🎯 Optymalizacje i edge cases
+
+#### Wykrywanie zombie processes
+```go
+// Sprawdzenie czy proces nadal istnieje
+err := process.Signal(syscall.Signal(0))  // Sygnał "sprawdzający"
+if err != nil {
+    // errno ESRCH = "No such process"
+    return false  // Proces nie istnieje
+}
 ```
 
-## Porównanie z innymi rozwiązaniami
-
-### vs Systemd
-| Cecha | Monitor Mutex | Systemd |
-|-------|---------------|---------|
-| Restart na brak logów | ✅ | ❌ |
-| Konfiguracja YAML | ✅ | ❌ |
-| Lekki footprint | ✅ | ❌ |
-| Integracja systemowa | ❌ | ✅ |
-
-### vs Supervisor
-| Cecha | Monitor Mutex | Supervisor |
-|-------|---------------|------------|
-| Monitoring logów | ✅ | ❌ |
-| Go dependency | ✅ | ❌ |
-| Python dependency | ❌ | ✅ |
-| Web interface | ❌ | ✅ |
-
-### vs Docker healthcheck
-| Cecha | Monitor Mutex | Docker |
-|-------|---------------|---------|
-| Log-based restart | ✅ | ❌ |
-| Native processes | ✅ | ❌ |
-| Container overhead | ❌ | ✅ |
-| Orchestration | ❌ | ✅ |
-
-## Wymagania systemowe
-
-### Minimalne wymagania
-- **OS**: Linux, macOS, Windows (ograniczone)
-- **RAM**: 10MB
-- **CPU**: Dowolny (bardzo niskie użycie)
-- **Go**: 1.19+ (do kompilacji)
-
-### Zalecane narzędzia
-- `ps` - informacje o procesach
-- `kill` - wysyłanie sygnałów
-- `tail` - debugowanie logów
-
-### Zależności Go
-```bash
-go mod init monitor
-go get gopkg.in/yaml.v2
+#### Context cancellation
+```go
+// Przerwanie przy shutdown aplikacji
+select {
+case <-m.ctx.Done():      // Context został anulowany
+    m.killProcess()       // Wyczyść zasoby
+    return
+case <-ticker.C:          // Normalna operacja
+    // monitoring logic
+}
 ```
 
-## Rozwój i contribucje
+#### Process group handling
+```go
+// Dla skomplikowanych komend (pipe, &&, ||)
+cmd := exec.CommandContext(ctx, "sh", "-c", command)
+cmd.SysProcAttr = &syscall.SysProcAttr{
+    Setpgid: true,  // Utwórz nową grupę procesów
+}
 
-### Planowane funkcje
-- [ ] Metryki Prometheus
-- [ ] Web dashboard
-- [ ] Slack/Discord notyfikacje
-- [ ] Rolling restarts
-- [ ] Health checks HTTP
-- [ ] Log parsing rules
-
-### Struktura kodu
-```
-monitor_mutex.go
-├── Types (Config, Monitor, ProcessConfig)
-├── Core Logic (Monitor.Run, checkLogs, startProcess)
-├── Process Management (killProcess, isProcessRunning)
-├── Configuration (loadConfig, validation)
-└── CLI Interface (main, printUsage)
+// Zabij całą grupę procesów
+syscall.Kill(-pid, syscall.SIGTERM)  // Minus oznacza grupę
 ```
 
-### Testowanie
-```bash
-# Unit testy
-go test -v
+### 📊 Metryki i monitoring zabijania
 
-# Integration testy
-./test_scenarios.sh
+#### Typy zakończeń procesów
+- **GRACEFUL** - proces zakończył się po SIGTERM (0-5s)
+- **FORCED** - proces zabity przez SIGKILL (5-7s)  
+- **ZOMBIE** - proces może być w stanie zombie (>7s)
+- **ERROR** - błąd podczas wysyłania sygnałów
 
-# Load test
-for i in {1..10}; do ./monitor_mutex "echo test" "/tmp/test$i.log" & done
+#### Statystyki w logach
+```
+=== Statystyki zabijania procesów ===
+Grzeczne zamknięcia: 45 (78%)
+Wymuszone zamknięcia: 12 (21%) 
+Procesy zombie: 1 (1%)
+Średni czas grzecznego zamknięcia: 2.3s
+Średni czas wymuszonego zamknięcia: 6.8s
+```
+
+### ⚠️ Problemy i rozwiązania
+
+#### Problem: Proces ignoruje SIGTERM
+**Przyczyna**: Aplikacja przechwytuje sygnał ale nie kończy działania
+```go
+// Aplikacja może robić to:
+signal.Ignore(syscall.SIGTERM)
+// lub
+signal.Notify(c, syscall.SIGTERM)
+for sig := range c {
+    log.Printf("Ignoruję sygnał: %v", sig)
+    // Ale nie wywołuje os.Exit()
+}
+```
+
+**Rozwiązanie**: SIGKILL nie może być zignorowany
+```go
+// Monitor automatycznie użyje SIGKILL po timeout
+case <-time.After(5 * time.Second):
+    process.Kill()  // SIGKILL - bezwzględne
 ```
