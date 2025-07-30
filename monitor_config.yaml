@@ -1,0 +1,37 @@
+# Automatycznie wygenerowana konfiguracja monitora
+# Data: 2025-07-30 11:19:05
+# Użycie: monitor_mutex --config monitor_config.yaml
+
+processes:
+  - name: "bash"
+    command: "bash -c while true; do echo \\\"$(date) [INFO] App1 processing data...\\\"; sleep 8; done > /tmp/app1.log"
+    log_file: "/home/user/nohup.out"
+    timeout: 45
+    interval: 8
+
+  - name: "python3"
+    command: "python3 -m http.server 8080"
+    log_file: "/tmp/webserver.log"
+    timeout: 30
+    interval: 5
+
+  - name: "python"
+    command: "python app.py"
+    log_file: "/mnt/c/Users/user/Desktop/pdf_analizer/logs/pdf_analyzer.log"
+    timeout: 45
+    interval: 8
+
+  - name: "python"
+    command: "/mnt/c/Users/user/Desktop/pdf_analizer/venv/bin/python app.py"
+    log_file: "/mnt/c/Users/user/Desktop/pdf_analizer/logs/pdf_analyzer.log"
+    timeout: 45
+    interval: 8
+
+  - name: "sleep"
+    command: "sleep 8"
+    log_file: "/tmp/app1.log"
+    timeout: 30
+    interval: 5
+
+# Uruchom monitor poleceniem:
+# ./monitor_mutex --config monitor_config.yaml
